@@ -22,6 +22,7 @@ const maxmind = maxmindModule.default || maxmindModule;
 // Node.js 内置模块可以静态导入
 import https from "https";
 import tls from "tls";
+import net from "net";
 import dns from "dns";
 
 const dnsLookup = promisify(dns.lookup);
@@ -44,8 +45,8 @@ const WEBSOCKET_TIMEOUT = 3000; // WebSocket 连接超时（毫秒）
 const CDN_TRACE_TIMEOUT = 3000; // CDN Trace 请求超时（毫秒）
 
 // 功能开关配置
-const DISABLE_WEBSOCKET = process.env.DISABLE_WEBSOCKET === 'true' || false; // 禁用 WebSocket 检测（用于云平台）
-const DISABLE_CDN_TRACE = process.env.DISABLE_CDN_TRACE === 'true' || false; // 禁用 CDN Trace 检测
+const DISABLE_WEBSOCKET = process.env.DISABLE_WEBSOCKET === 'true'; // 禁用 WebSocket 检测（用于云平台）
+const DISABLE_CDN_TRACE = process.env.DISABLE_CDN_TRACE === 'true'; // 禁用 CDN Trace 检测
 
 // DNS 解析配置
 const DNS_MAX_RECURSION_DEPTH = 10; // CNAME 递归解析最大深度
@@ -69,7 +70,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; padding: 20px; max-width: 1200px; margin: 0 auto; }
   h2 { margin-top: 0; color: #333; }
-  #map { height: 400px; width: 100%; margin-top: 20px; border: 1px solid #ddd; border-radius: 8px; }
+  #map { height: 400px; width: 100%; margin-top: 20px; border: 1px solid #ddd; border-radius: 8px; touch-action: pan-x pan-y; }
   .container { display: flex; gap: 20px; flex-wrap: wrap; }
   .form-box { flex: 1; max-width: 350px; }
   .info-box { flex: 2; min-width: 400px; }
@@ -79,6 +80,12 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   button { width: 100%; padding: 12px; margin: 12px 0; background: #4CAF50; color: white; border: none; border-radius: 4px; font-size: 16px; font-weight: 500; cursor: pointer; }
   button:hover { background: #45a049; }
   button:disabled { background: #ccc; cursor: not-allowed; }
+  .quick-btn { width: 100%; padding: 8px; margin: 4px 0; background: #2196F3; color: white; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }
+  .quick-btn:hover { background: #1976D2; }
+  .quick-btn-group { margin: 15px 0; }
+  .quick-label { font-size: 12px; color: #666; margin-bottom: 8px; font-weight: 500; }
+  .help-text { margin-top: 20px; font-size: 12px; color: #666; }
+  .optional { color: #999; font-weight: normal; }
   table { border-collapse: collapse; width: 100%; margin-top: 10px; }
   th, td { text-align: left; padding: 10px; border-bottom: 1px solid #eee; }
   th { background: #f5f5f5; font-weight: 600; color: #333; position: sticky; top: 0; z-index: 10; }
@@ -97,15 +104,22 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     <label>IP:端口</label>
     <input type="text" id="ipPort" placeholder="1.164.110.203:10029" />
 
-    <label>Host (SNI) <span style="color: #999; font-weight: normal;">(可选)</span></label>
-    <input type="text" id="host" placeholder="留空使用内置默认值" />
+    <label>Host (SNI) <span class="optional">(可选)</span></label>
+    <input type="text" id="host" placeholder="此处填写你的CF节点域名" />
 
     <button onclick="detectIP()" id="submitBtn">检测</button>
 
-    <div style="margin-top: 20px; font-size: 12px; color: #666;">
+    <div class="quick-btn-group">
+      <div class="quick-label">快速选择：</div>
+      <button class="quick-btn" onclick="selectQuickOption('ProxyIP.KR.CMLiussss.net')">韩国 KR</button>
+      <button class="quick-btn" onclick="selectQuickOption('ProxyIP.JP.CMLiussss.net')">日本 JP</button>
+      <button class="quick-btn" onclick="selectQuickOption('ProxyIP.SG.CMLiussss.net')">新加坡 SG</button>
+    </div>
+
+    <div class="help-text">
       支持格式：IP:端口，如 <code>1.164.110.203:10029</code><br>
       端口默认为 443（可省略）<br>
-      Host 留空将使用内置默认值
+      Host 填写你的CF节点域名
     </div>
   </div>
 
@@ -144,11 +158,41 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
 <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 <script>
-let map = L.map('map').setView([35, 139], 5);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; OpenStreetMap contributors'
+// 配置 Leaflet 使用 passive 事件监听器以减少警告
+(function() {
+  const originalAddListener = L.DomEvent.addListener;
+  L.DomEvent.addListener = function(obj, type, handler, context) {
+    // 为 touch 事件添加 passive 选项
+    if (L.Browser.touch && (type === 'touchstart' || type === 'touchmove')) {
+      obj.addEventListener(type, handler, { passive: true });
+      return handler;
+    }
+    return originalAddListener.call(this, obj, type, handler, context);
+  };
+})();
+
+let map = L.map('map', {
+  zoomControl: true,
+  attributionControl: true,
+  // 优化触摸体验
+  touchZoom: true,
+  doubleClickZoom: true,
+  scrollWheelZoom: true
+}).setView([35, 139], 5);
+
+// 使用 Esri World Street Map（全球覆盖，免费）
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+  attribution: '&copy; <a href="https://www.esri.com/" target="_blank">Esri</a> | &copy; OpenStreetMap',
+  maxZoom: 19,
+  minZoom: 2
 }).addTo(map);
+
 let marker = null;
+
+function selectQuickOption(domain) {
+  document.getElementById('ipPort').value = domain;
+  document.getElementById('host').value = '';
+}
 
 async function detectIP() {
   const ipPortInput = document.getElementById('ipPort').value.trim();
@@ -161,11 +205,6 @@ async function detectIP() {
     return;
   }
 
-  // 如果 Host 为空，留空让后端使用默认值
-  if (!host) {
-    host = "";
-  }
-
   // 解析 IP:端口 格式
   let ip, port = 443;
   const ipPortMatch = ipPortInput.match(/^(.+?):(\\d+)$/);
@@ -173,7 +212,6 @@ async function detectIP() {
     ip = ipPortMatch[1];
     port = ipPortMatch[2];
   } else {
-    // 如果没有端口，尝试作为纯 IP
     ip = ipPortInput;
   }
 
@@ -197,86 +235,12 @@ async function detectIP() {
     }
 
     updateInfo(data);
-    
-    // 在控制台输出详细信息
-    logDetailedInfo(data);
   } catch(err) {
     alert("检测失败: " + err.message);
-    console.error("检测错误:", err);
   } finally {
     submitBtn.disabled = false;
     submitBtn.textContent = "检测";
   }
-}
-
-function logDetailedInfo(data) {
-  console.group('🔍 检测详细信息');
-  
-  // 基本信息
-  console.log('📋 基本信息:', {
-    IP: data.ip,
-    端口: data.port,
-    Host: data.host,
-    时间戳: data.timestamp
-  });
-  
-  // GeoIP 信息
-  if (data.geoip) {
-    console.log('🌍 GeoIP 信息:', data.geoip);
-  } else {
-    console.warn('⚠️ GeoIP 信息: 未找到');
-  }
-  
-  // TLS 检测信息
-  console.log('🔒 TLS 检测:', {
-    状态: data.checks?.tls_detect ? '✓ 成功' : '✕ 失败',
-    延迟: data.latency?.tls_handshake_ms ? \`\${data.latency.tls_handshake_ms}ms\` : 'N/A'
-  });
-  
-  // WebSocket 检测信息
-  if (data.websocket) {
-    console.group('🔌 WebSocket 详细信息');
-    if (data.websocket.error) {
-      console.error('❌ WebSocket 错误:', data.websocket.error);
-    } else {
-      console.log('✓ WebSocket 连接成功');
-      console.log('  连接 URL:', data.websocket.url);
-      console.log('  连接状态:', data.websocket.readyState);
-      console.log('  协议:', data.websocket.protocol);
-      console.log('  扩展:', data.websocket.extensions);
-      console.log('  延迟:', data.latency?.ws_connect_ms ? \`\${data.latency.ws_connect_ms}ms\` : 'N/A');
-    }
-    console.groupEnd();
-  } else {
-    console.warn('⚠️ WebSocket 信息: 无数据');
-  }
-  
-  // CDN Trace 信息
-  console.group('🌐 CDN Trace 详细信息');
-  if (data.cdn?.trace) {
-    console.log('✓ Trace 内容:');
-    console.log(data.cdn.trace);
-    console.log('Warp 状态:', data.cdn?.warp || 'off');
-  } else {
-    console.warn('⚠️ CDN Trace: 未获取到内容');
-  }
-  console.groupEnd();
-  
-  // 检测结果汇总
-  console.group('📊 检测结果汇总');
-  console.table({
-    'TLS 检测': data.checks?.tls_detect ? '✓' : '✕',
-    'WebSocket 可用': data.checks?.ws_real_connect ? '✓' : '✕',
-    'CDN Trace': data.checks?.cdn_trace ? '✓' : '✕'
-  });
-  console.groupEnd();
-  
-  // 完整响应数据（展开查看）
-  console.group('📦 完整响应数据');
-  console.log(data);
-  console.groupEnd();
-  
-  console.groupEnd();
 }
 
 // 格式化位置信息
@@ -425,6 +389,11 @@ function updateMultiResults(data) {
 app.get("/", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(HTML_TEMPLATE);
+});
+
+// 处理 favicon.ico 请求（避免 404 错误）
+app.get("/favicon.ico", (req, res) => {
+  res.status(204).end();
 });
 
 // ------------------- 初始化 GeoIP 数据库 -------------------
@@ -1044,29 +1013,30 @@ async function testWebSocket(ip, port = DEFAULT_PORT, host, wsPath = DEFAULT_WS_
     };
 
     try {
-      // 使用 createConnection 自定义底层 TLS 连接以设置 SNI
-      const createConnection = (options, callback) => {
-        const socket = tls.connect({
-          host: ip,
-          port: port,
-          servername: host, // 设置 SNI（Server Name Indication）
-          rejectUnauthorized: false,
-          // 移除一些可能导致权限问题的选项
-          ...options
-        }, callback);
-        return socket;
-      };
-
+      // WebSocket 连接配置
       const wsOptions = {
         rejectUnauthorized: false, // 允许自签名证书（用于测试）
         handshakeTimeout: WEBSOCKET_TIMEOUT,
         perMessageDeflate: false,
         headers: {
-          'Host': host // 在 Host 头中指定原始 host
-        },
-        // 仅在支持的环境中使用自定义连接
-        ...(host ? { createConnection } : {})
+          'Host': host || ip // 在 Host 头中指定原始 host
+        }
       };
+
+      // 使用 createConnection 自定义底层 TLS 连接以设置 SNI（仅在有 host 时）
+      if (host) {
+        wsOptions.createConnection = (options, callback) => {
+          // 直接使用 tls.connect，设置正确的 host 和 servername
+          const socket = tls.connect({
+            host: ip,              // 连接到实际 IP
+            port: port,            // 连接到实际端口
+            servername: host,      // SNI 使用 host 域名
+            rejectUnauthorized: false,
+            ...options
+          }, callback);
+          return socket;
+        };
+      }
 
       const ws = new WebSocket(url, wsOptions);
 
@@ -1098,12 +1068,23 @@ async function testWebSocket(ip, port = DEFAULT_PORT, host, wsPath = DEFAULT_WS_
       });
 
       ws.on("error", (err) => {
-        // 忽略 EACCES 权限错误等常见云平台限制
+        // 处理各种 WebSocket 连接错误
         const errorMsg = err.message || "";
+        const errorCode = err.code || "";
+        
         if (errorMsg.includes("EACCES") ||
             errorMsg.includes("permission denied") ||
             errorMsg.includes("EPERM")) {
           safeReject(new Error("当前环境不支持 WebSocket 检测（权限限制）"));
+        } else if (errorMsg.includes("ECONNREFUSED") || 
+                   errorCode === "ECONNREFUSED") {
+          safeReject(new Error("WebSocket 连接被拒绝（目标服务器未开放该端口或服务）"));
+        } else if (errorMsg.includes("ETIMEDOUT") || 
+                   errorMsg.includes("timeout")) {
+          safeReject(new Error("WebSocket 连接超时"));
+        } else if (errorMsg.includes("ENOTFOUND") || 
+                   errorMsg.includes("getaddrinfo")) {
+          safeReject(new Error("无法解析目标地址"));
         } else {
           safeReject(new Error(errorMsg || "WebSocket 连接失败"));
         }
@@ -1187,6 +1168,11 @@ app.use((err, req, res, next) => {
 
 // ------------------- 404 处理 -------------------
 app.use((req, res) => {
+  // 对于静态资源请求返回 204，避免产生错误日志
+  if (req.path.match(/\.(ico|png|jpg|jpeg|gif|svg|css|js|woff|woff2|ttf|eot)$/i)) {
+    res.status(204).end();
+    return;
+  }
   res.status(404).json({ 
     error: "未找到资源",
     message: `路径 ${req.path} 不存在`
