@@ -22,7 +22,6 @@ const maxmind = maxmindModule.default || maxmindModule;
 // Node.js 内置模块可以静态导入
 import https from "https";
 import tls from "tls";
-import net from "net";
 import dns from "dns";
 
 const dnsLookup = promisify(dns.lookup);
@@ -30,17 +29,31 @@ const dnsResolve4 = promisify(dns.resolve4);
 const dnsResolveCname = promisify(dns.resolveCname);
 const dnsResolve = promisify(dns.resolve);
 
+// 异步文件操作
+const readFile = promisify(fs.readFile);
+const access = promisify(fs.access);
+
+// 检查文件是否存在（异步）
+async function fileExists(filePath) {
+    try {
+        await access(filePath, fs.constants.F_OK);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 // ==================== 配置参数 ====================
-// 服务器配置 - 固定端口 3000
-const PORT = parseInt(process.env.PORT) || 3000;
+// 服务器配置
+const PORT = parseInt(process.env.PORT) || 8888;
 
 // 缓存和速率限制配置
 const CACHE_DURATION = 30000; // 缓存持续时间（毫秒）- 30秒
-const MAX_REQUESTS_PER_IP = 10; // 每个IP每分钟最大请求数
+const MAX_REQUESTS_PER_IP = 60; // 每个IP每分钟最大请求数
 const RATE_LIMIT_WINDOW = 60000; // 速率限制时间窗口（毫秒）- 1分钟
 
 // 检测超时配置
-const TLS_TIMEOUT = 5000; // TLS/HTTPS 连接超时（毫秒）
+const TLS_TIMEOUT = 3000; // TLS/HTTPS 连接超时（毫秒）
 const WEBSOCKET_TIMEOUT = 3000; // WebSocket 连接超时（毫秒）
 const CDN_TRACE_TIMEOUT = 3000; // CDN Trace 请求超时（毫秒）
 
@@ -56,9 +69,319 @@ const DEFAULT_PORT = 443; // 默认端口
 const DEFAULT_HOST = "clpan.pages.dev"; // 默认 Host (SNI)
 const DEFAULT_WS_PATH = "/"; // 默认 WebSocket 路径
 
+// 内存管理配置
+const MEMORY_CHECK_INTERVAL = 300000; // 内存检查间隔（毫秒）- 5分钟
+const MEMORY_CLEANUP_THRESHOLD = 200; // 内存清理阈值（MB）- 堆内存使用超过此值时触发清理
+const MEMORY_CRITICAL_THRESHOLD = 280; // 内存严重阈值（MB）- 堆内存使用超过此值时强制清理
+const MEMORY_CLEANUP_INTERVAL = 60000; // 内存清理间隔（毫秒）- 1分钟
+
+// 日志配置（仅输出到控制台，不保存文件）
+const LOG_LEVEL = process.env.LOG_LEVEL || 'INFO'; // 日志级别: DEBUG, INFO, WARN, ERROR
+const LOG_ENABLE_COLOR = process.platform !== 'win32' || process.env.CI !== 'true'; // 日志颜色支持
+// 检测过程的详细日志（设置为false可减少日志输出）
+const ENABLE_DETECTION_DEBUG = process.env.ENABLE_DETECTION_DEBUG === 'true'; // 是否显示检测过程的DEBUG日志
+// 静默模式（不输出任何检测内容，只输出启动信息和严重错误）
+const QUIET_MODE = process.env.QUIET_MODE === 'true'; // 静默模式：不输出检测相关日志
+
 // ==================== 配置参数结束 ====================
 
+// ------------------- 日志系统（仅输出到控制台，不保存文件）-------------------
+const LOG_LEVELS = {
+  DEBUG: 0,
+  INFO: 1,
+  WARN: 2,
+  ERROR: 3
+};
+
+const currentLogLevel = LOG_LEVELS[LOG_LEVEL.toUpperCase()] || LOG_LEVELS.INFO;
+
+// 颜色代码（仅用于控制台输出）
+const colors = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m'
+};
+
+function getColor(colorName) {
+  return LOG_ENABLE_COLOR ? colors[colorName] || '' : '';
+}
+
+function formatTimestamp() {
+  const now = new Date();
+  return now.toISOString().replace('T', ' ').substring(0, 23);
+}
+
+function formatData(data) {
+  if (data === null || data === undefined) return '';
+  if (typeof data !== 'object') return String(data);
+  
+  // 格式化对象数据，使其更易读
+  const entries = Object.entries(data);
+  if (entries.length === 0) return '';
+  
+  // 对于单行显示，使用简洁格式
+  const formatted = entries.map(([key, value]) => {
+    if (value === null || value === undefined) return `${key}=null`;
+    if (typeof value === 'object') return `${key}=${JSON.stringify(value)}`;
+    return `${key}=${value}`;
+  }).join(', ');
+  
+  return `{ ${formatted} }`;
+}
+
+function log(level, message, data = null) {
+  const levelNum = LOG_LEVELS[level] || LOG_LEVELS.INFO;
+  if (levelNum < currentLogLevel) return;
+
+  const timestamp = formatTimestamp();
+  let color = '';
+  let prefix = '';
+
+  switch (level) {
+    case 'DEBUG':
+      color = getColor('dim');
+      prefix = 'DEBUG';
+      break;
+    case 'INFO':
+      color = getColor('cyan');
+      prefix = 'INFO ';
+      break;
+    case 'WARN':
+      color = getColor('yellow');
+      prefix = 'WARN ';
+      break;
+    case 'ERROR':
+      color = getColor('red');
+      prefix = 'ERROR';
+      break;
+  }
+
+  const resetColor = getColor('reset');
+  let logMessage = `${color}[${timestamp}] [${prefix}]${resetColor} ${message}`;
+  
+  if (data !== null && data !== undefined) {
+    const formattedData = formatData(data);
+    if (formattedData) {
+      logMessage += ` ${formattedData}`;
+    }
+  }
+
+  // 根据日志级别选择输出方法
+  if (level === 'ERROR') {
+    console.error(logMessage);
+  } else if (level === 'WARN') {
+    console.warn(logMessage);
+  } else {
+    console.log(logMessage);
+  }
+}
+
+// 日志快捷方法
+const logger = {
+  debug: (msg, data) => log('DEBUG', msg, data),
+  info: (msg, data) => log('INFO', msg, data),
+  warn: (msg, data) => log('WARN', msg, data),
+  error: (msg, data) => log('ERROR', msg, data)
+};
+
+// ------------------- 内存管理模块 --------------------
+let memoryStats = {
+  lastCheck: Date.now(),
+  cleanupCount: 0,
+  lastCleanup: Date.now(),
+  peakHeapUsed: 0,
+  peakRss: 0
+};
+
+function getMemoryUsage() {
+  const usage = process.memoryUsage();
+  return {
+    heapUsed: Math.round(usage.heapUsed / 1024 / 1024),
+    heapTotal: Math.round(usage.heapTotal / 1024 / 1024),
+    rss: Math.round(usage.rss / 1024 / 1024),
+    external: Math.round(usage.external / 1024 / 1024)
+  };
+}
+
+function logMemoryUsage(context = '') {
+  const mem = getMemoryUsage();
+  const contextText = context ? ` ${context}` : '';
+  logger.info(`内存使用${contextText}`, {
+    heap: `${mem.heapUsed}/${mem.heapTotal} MB`,
+    rss: `${mem.rss} MB`,
+    cache: requestCache.size,
+    rateLimit: rateLimitMap.size
+  });
+
+  // 更新峰值记录
+  if (mem.heapUsed > memoryStats.peakHeapUsed) {
+    memoryStats.peakHeapUsed = mem.heapUsed;
+  }
+  if (mem.rss > memoryStats.peakRss) {
+    memoryStats.peakRss = mem.rss;
+  }
+}
+
+function performMemoryCleanup(force = false) {
+  const mem = getMemoryUsage();
+  const now = Date.now();
+  
+  logger.info('开始内存清理', {
+    heapUsed: `${mem.heapUsed} MB`,
+    cacheSize: requestCache.size,
+    rateLimitSize: rateLimitMap.size,
+    force
+  });
+
+  let cleanedCount = 0;
+  const startTime = Date.now();
+
+  // 1. 清理过期缓存
+  for (const [key, value] of requestCache.entries()) {
+    if (now - value.timestamp > CACHE_DURATION) {
+      requestCache.delete(key);
+      cleanedCount++;
+    }
+  }
+
+  // 2. 清理过期的速率限制记录
+  for (const [key, record] of rateLimitMap.entries()) {
+    if (now - record.firstRequest > RATE_LIMIT_WINDOW * 2) {
+      rateLimitMap.delete(key);
+      cleanedCount++;
+    }
+  }
+
+  // 3. 强制清理：如果内存使用过高，清理更多缓存
+  if (force || mem.heapUsed > MEMORY_CLEANUP_THRESHOLD) {
+    // 清理最旧的一半缓存
+    if (requestCache.size > 500) {
+      const entries = Array.from(requestCache.entries())
+        .sort((a, b) => a[1].timestamp - b[1].timestamp);
+      const toDelete = entries.slice(0, Math.floor(entries.length / 2));
+      toDelete.forEach(([key]) => {
+        requestCache.delete(key);
+        cleanedCount++;
+      });
+    }
+
+    // 清理最旧的速率限制记录
+    if (rateLimitMap.size > 2500) {
+      const entries = Array.from(rateLimitMap.entries())
+        .sort((a, b) => a[1].firstRequest - b[1].firstRequest);
+      const toDelete = entries.slice(0, Math.floor(entries.length / 2));
+      toDelete.forEach(([key]) => {
+        rateLimitMap.delete(key);
+        cleanedCount++;
+      });
+    }
+  }
+
+  // 4. 严重内存压力：强制垃圾回收（如果可用）
+  if (mem.heapUsed > MEMORY_CRITICAL_THRESHOLD && global.gc) {
+    logger.warn('内存使用过高，执行强制垃圾回收', { heapUsed: `${mem.heapUsed} MB` });
+    try {
+      global.gc();
+    } catch (err) {
+      logger.error('垃圾回收失败', err.message);
+    }
+  }
+
+  const duration = Date.now() - startTime;
+  memoryStats.cleanupCount++;
+  memoryStats.lastCleanup = now;
+
+  const memAfter = getMemoryUsage();
+  logger.info('内存清理完成', {
+    cleaned: cleanedCount,
+    duration: `${duration}ms`,
+    heapUsedBefore: `${mem.heapUsed} MB`,
+    heapUsedAfter: `${memAfter.heapUsed} MB`,
+    cacheSize: requestCache.size,
+    rateLimitSize: rateLimitMap.size
+  });
+
+  return cleanedCount;
+}
+
+// 定期内存检查和清理
+let memoryCheckCounter = 0;
+setInterval(() => {
+  const mem = getMemoryUsage();
+  memoryStats.lastCheck = Date.now();
+  memoryCheckCounter++;
+
+  // 每5分钟输出一次内存使用情况（每5次检查输出一次，静默模式下不输出）
+  if (memoryCheckCounter % 5 === 0 && !QUIET_MODE) {
+    logMemoryUsage('定期检查');
+  }
+
+  // 如果内存使用超过阈值，触发清理
+  if (mem.heapUsed > MEMORY_CLEANUP_THRESHOLD) {
+    logger.warn('内存使用超过阈值，触发自动清理', {
+      heap: `${mem.heapUsed} MB`,
+      threshold: `${MEMORY_CLEANUP_THRESHOLD} MB`
+    });
+    performMemoryCleanup(true);
+  }
+
+  // 严重内存压力
+  if (mem.heapUsed > MEMORY_CRITICAL_THRESHOLD) {
+    logger.error('内存使用严重超标，执行强制清理', {
+      heap: `${mem.heapUsed} MB`,
+      critical: `${MEMORY_CRITICAL_THRESHOLD} MB`
+    });
+    performMemoryCleanup(true);
+  }
+}, MEMORY_CLEANUP_INTERVAL);
+
 const app = express();
+
+// 中间件
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// 压缩中间件（如果可用）
+try {
+    const compression = await import('compression');
+    app.use(compression.default());
+} catch (e) {
+    // compression 模块不可用，跳过
+}
+
+// 静态资源缓存和性能优化
+app.use((req, res, next) => {
+    // 为HTML设置缓存控制
+    if (req.path === '/' || req.path.endsWith('.html')) {
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+    }
+    // 为API设置缓存
+    if (req.path.startsWith('/api')) {
+        res.setHeader('Cache-Control', 'public, max-age=30');
+    }
+    next();
+});
+
+// CORS 支持
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    
+    if (req.method === 'OPTIONS') {
+        res.sendStatus(200);
+    } else {
+        next();
+    }
+});
 
 // ------------------- HTML 前端（集成在代码中）-------------------
 const HTML_TEMPLATE = `<!DOCTYPE html>
@@ -108,6 +431,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     <input type="text" id="host" placeholder="此处填写你的CF节点域名" />
 
     <button onclick="detectIP()" id="submitBtn">检测</button>
+    <button onclick="clearPanel()" id="clearBtn" style="background: #f44336; margin-top: 8px;">清理面板</button>
 
     <div class="quick-btn-group">
       <div class="quick-label">快速选择：</div>
@@ -156,43 +480,108 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   </div>
 </div>
 
-<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js" defer onerror="console.warn('Leaflet加载失败')"></script>
 <script>
-// 配置 Leaflet 使用 passive 事件监听器以减少警告
-(function() {
-  const originalAddListener = L.DomEvent.addListener;
-  L.DomEvent.addListener = function(obj, type, handler, context) {
-    // 为 touch 事件添加 passive 选项
-    if (L.Browser.touch && (type === 'touchstart' || type === 'touchmove')) {
-      obj.addEventListener(type, handler, { passive: true });
-      return handler;
-    }
-    return originalAddListener.call(this, obj, type, handler, context);
-  };
-})();
-
-let map = L.map('map', {
-  zoomControl: true,
-  attributionControl: true,
-  // 优化触摸体验
-  touchZoom: true,
-  doubleClickZoom: true,
-  scrollWheelZoom: true
-}).setView([35, 139], 5);
-
-// 使用 Esri World Street Map（全球覆盖，免费）
-L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
-  attribution: '&copy; <a href="https://www.esri.com/" target="_blank">Esri</a> | &copy; OpenStreetMap',
-  maxZoom: 19,
-  minZoom: 2
-}).addTo(map);
-
-let marker = null;
-
-function selectQuickOption(domain) {
-  document.getElementById('ipPort').value = domain;
-  document.getElementById('host').value = '';
+// HTML转义函数，防止XSS攻击
+function escapeHtml(text) {
+  if (text == null) return '';
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
 }
+
+// 全局函数 - 必须在页面加载前定义
+function selectQuickOption(domain) {
+  const ipPortInput = document.getElementById('ipPort');
+  const hostInput = document.getElementById('host');
+  if (ipPortInput) {
+    ipPortInput.value = domain;
+  }
+  if (hostInput) {
+    hostInput.value = '';
+  }
+}
+
+// 清理面板内容
+function clearPanel() {
+  // 清理地图标记
+  if (window.map && window.marker) {
+    window.map.removeLayer(window.marker);
+    window.marker = null;
+    // 重置地图视图到默认位置
+    window.map.setView([35, 139], 5);
+  }
+
+  // 隐藏结果表格
+  const infoTable = document.getElementById('infoTable');
+  const multiResultPanel = document.getElementById('multiResultPanel');
+  
+  if (infoTable) {
+    infoTable.style.display = 'none';
+    const tbody = infoTable.querySelector('tbody');
+    if (tbody) {
+      tbody.innerHTML = '';
+    }
+  }
+
+  if (multiResultPanel) {
+    multiResultPanel.style.display = 'none';
+    const tbody = document.getElementById('resultsTableBody');
+    if (tbody) {
+      tbody.innerHTML = '';
+    }
+    // 清空标题信息
+    const inputDomain = document.getElementById('inputDomain');
+    const resolvedCount = document.getElementById('resolvedCount');
+    if (inputDomain) inputDomain.textContent = '';
+    if (resolvedCount) resolvedCount.textContent = '';
+  }
+
+  // 清空输入框（可选）
+  const ipPortInput = document.getElementById('ipPort');
+  const hostInput = document.getElementById('host');
+  if (ipPortInput) ipPortInput.value = '';
+  if (hostInput) hostInput.value = '';
+
+  console.log('面板内容已清理');
+}
+
+// 等待 Leaflet 加载完成
+document.addEventListener('DOMContentLoaded', function() {
+  // 配置 Leaflet 使用 passive 事件监听器以减少警告
+  if (typeof L !== 'undefined') {
+    (function() {
+      const originalAddListener = L.DomEvent.addListener;
+      L.DomEvent.addListener = function(obj, type, handler, context) {
+        // 为 touch 事件添加 passive 选项
+        if (L.Browser.touch && (type === 'touchstart' || type === 'touchmove')) {
+          obj.addEventListener(type, handler, { passive: true });
+          return handler;
+        }
+        return originalAddListener.call(this, obj, type, handler, context);
+      };
+    })();
+
+    let map = L.map('map', {
+      zoomControl: true,
+      attributionControl: true,
+      // 优化触摸体验
+      touchZoom: true,
+      doubleClickZoom: true,
+      scrollWheelZoom: true
+    }).setView([35, 139], 5);
+
+    // 使用 Esri World Street Map（全球覆盖，免费）
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+      attribution: '&copy; <a href="https://www.esri.com/" target="_blank">Esri</a> | &copy; OpenStreetMap',
+      maxZoom: 19,
+      minZoom: 2
+    }).addTo(map);
+
+    window.map = map;
+    window.marker = null;
+  }
+});
 
 async function detectIP() {
   const ipPortInput = document.getElementById('ipPort').value.trim();
@@ -207,10 +596,10 @@ async function detectIP() {
 
   // 解析 IP:端口 格式
   let ip, port = 443;
-  const ipPortMatch = ipPortInput.match(/^(.+?):(\\d+)$/);
+  const ipPortMatch = ipPortInput.match(/^(.+?):(\d+)$/);
   if (ipPortMatch) {
     ip = ipPortMatch[1];
-    port = ipPortMatch[2];
+    port = parseInt(ipPortMatch[2]);
   } else {
     ip = ipPortInput;
   }
@@ -256,14 +645,18 @@ function formatLocation(geoip) {
 
 // 更新地图标记
 function updateMapMarker(data) {
-  if (marker) map.removeLayer(marker);
-  marker = null;
+  if (!window.map) return;
+  
+  if (window.marker) {
+    window.map.removeLayer(window.marker);
+    window.marker = null;
+  }
   
   if (data.geoip?.latitude && data.geoip?.longitude) {
     const locationText = formatLocation(data.geoip);
-    marker = L.marker([data.geoip.latitude, data.geoip.longitude]).addTo(map)
-      .bindPopup(\`\${data.ip}<br>\${locationText}\`).openPopup();
-    map.setView([data.geoip.latitude, data.geoip.longitude], 10);
+    window.marker = L.marker([data.geoip.latitude, data.geoip.longitude]).addTo(window.map)
+      .bindPopup(\`\${escapeHtml(data.ip)}<br>\${escapeHtml(locationText)}\`).openPopup();
+    window.map.setView([data.geoip.latitude, data.geoip.longitude], 10);
   }
 }
 
@@ -295,7 +688,7 @@ function updateInfo(data) {
 
   infoList.forEach(([key, value]) => {
     const row = document.createElement('tr');
-    row.innerHTML = \`<th>\${key}</th><td>\${value}</td>\`;
+    row.innerHTML = \`<th>\${escapeHtml(key)}</th><td>\${escapeHtml(String(value))}</td>\`;
     tbody.appendChild(row);
   });
 
@@ -336,9 +729,9 @@ function updateMultiResults(data) {
         : "-";
 
       row.innerHTML = \`
-        <td><strong>\${result.ip}</strong></td>
-        <td>\${formatLocation(result.geoip)}</td>
-        <td style="font-size: 12px;">\${orgAsn}</td>
+        <td><strong>\${escapeHtml(result.ip)}</strong></td>
+        <td>\${escapeHtml(formatLocation(result.geoip))}</td>
+        <td style="font-size: 12px;">\${escapeHtml(orgAsn)}</td>
         <td class="\${result.checks?.tls_detect ? 'status-success' : 'status-fail'}">
           \${result.checks?.tls_detect ? '✓' : '✕'}
         </td>
@@ -348,17 +741,19 @@ function updateMultiResults(data) {
         <td class="\${result.checks?.cdn_trace ? 'status-success' : 'status-fail'}">
           \${result.checks?.cdn_trace ? '✓' : '✕'}
         </td>
-        <td>\${result.latency?.tls_handshake_ms ? result.latency.tls_handshake_ms + 'ms' : '-'}</td>
-        <td>\${result.latency?.ws_connect_ms ? result.latency.ws_connect_ms + 'ms' : '-'}</td>
-        <td>\${result.cdn?.warp || 'off'}</td>
+        <td>\${result.latency?.tls_handshake_ms ? escapeHtml(String(result.latency.tls_handshake_ms)) + 'ms' : '-'}</td>
+        <td>\${result.latency?.ws_connect_ms ? escapeHtml(String(result.latency.ws_connect_ms)) + 'ms' : '-'}</td>
+        <td>\${escapeHtml(result.cdn?.warp || 'off')}</td>
       \`;
       
       tbody.appendChild(row);
     });
 
     // 更新地图 - 显示第一个成功的IP位置（使用过滤后的有效结果）
-    if (marker) map.removeLayer(marker);
-    marker = null;
+    if (window.marker && window.map) {
+      window.map.removeLayer(window.marker);
+      window.marker = null;
+    }
     
     // 查找第一个成功的IP（优先 TLS，其次 WebSocket，最后有 GeoIP 的）
     let firstSuccessIP = null;
@@ -388,6 +783,8 @@ function updateMultiResults(data) {
 // 根路径返回 HTML
 app.get("/", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.send(HTML_TEMPLATE);
 });
 
@@ -395,6 +792,95 @@ app.get("/", (req, res) => {
 app.get("/favicon.ico", (req, res) => {
   res.status(204).end();
 });
+
+// 健康检查端点
+app.get("/health", (req, res) => {
+  const memoryUsage = process.memoryUsage();
+  res.json({
+    status: "healthy",
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    memory: {
+      used: Math.round(memoryUsage.heapUsed / 1024 / 1024) + " MB",
+      total: Math.round(memoryUsage.heapTotal / 1024 / 1024) + " MB",
+      rss: Math.round(memoryUsage.rss / 1024 / 1024) + " MB"
+    },
+    cache: {
+      size: requestCache.size,
+      rateLimitSize: rateLimitMap.size
+    },
+    geoip: {
+      asn: asnReader !== null,
+      city: cityReader !== null
+    },
+    features: {
+      websocket: !DISABLE_WEBSOCKET,
+      cdnTrace: !DISABLE_CDN_TRACE
+    }
+  });
+});
+
+// 统计信息端点
+app.get("/stats", (req, res) => {
+  const memoryUsage = process.memoryUsage();
+  const cacheEntries = Array.from(requestCache.entries());
+  const recentRequests = cacheEntries
+    .sort((a, b) => b[1].timestamp - a[1].timestamp)
+    .slice(0, 10)
+    .map(([key, value]) => ({
+      key,
+      timestamp: new Date(value.timestamp).toISOString(),
+      age: Math.round((Date.now() - value.timestamp) / 1000) + "s"
+    }));
+  
+  res.json({
+    server: {
+      uptime: process.uptime(),
+      uptimeFormatted: formatUptime(process.uptime()),
+      nodeVersion: process.version,
+      platform: process.platform
+    },
+    memory: {
+      heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024),
+      heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024),
+      rss: Math.round(memoryUsage.rss / 1024 / 1024),
+      external: Math.round(memoryUsage.external / 1024 / 1024)
+    },
+    cache: {
+      size: requestCache.size,
+      rateLimitSize: rateLimitMap.size,
+      recentRequests
+    },
+    geoip: {
+      asnLoaded: asnReader !== null,
+      cityLoaded: cityReader !== null
+    },
+    config: {
+      port: PORT,
+      cacheDuration: CACHE_DURATION / 1000 + "s",
+      maxRequestsPerIP: MAX_REQUESTS_PER_IP,
+      rateLimitWindow: RATE_LIMIT_WINDOW / 1000 + "s",
+      tlsTimeout: TLS_TIMEOUT,
+      wsTimeout: WEBSOCKET_TIMEOUT,
+      cdnTraceTimeout: CDN_TRACE_TIMEOUT,
+      disableWebSocket: DISABLE_WEBSOCKET,
+      disableCdnTrace: DISABLE_CDN_TRACE
+    }
+  });
+});
+
+// 格式化运行时间
+function formatUptime(seconds) {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  
+  if (days > 0) return `${days}d ${hours}h ${minutes}m ${secs}s`;
+  if (hours > 0) return `${hours}h ${minutes}m ${secs}s`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
 
 // ------------------- 初始化 GeoIP 数据库 -------------------
 let cityReader = null;
@@ -408,19 +894,19 @@ async function downloadGeoIPDatabase(dbPath, dbName) {
   
   for (const downloadUrl of downloadUrls) {
     try {
-      console.log(`📥 尝试下载: ${downloadUrl}`);
+      logger.info(`尝试下载 GeoIP 数据库`, { url: downloadUrl, dbName });
       const response = await axios.get(downloadUrl, {
         responseType: 'arraybuffer',
         timeout: 60000,
         maxContentLength: 100 * 1024 * 1024 // 最大 100MB
       });
       
-      fs.writeFileSync(dbPath, response.data);
+      await fs.promises.writeFile(dbPath, response.data);
       const fileSize = (response.data.length / 1024 / 1024).toFixed(2);
-      console.log(`✅ ${dbName} 下载成功: ${dbPath} (${fileSize} MB)`);
+      logger.info(`${dbName} 下载成功`, { path: dbPath, size: `${fileSize} MB` });
       return true;
     } catch (urlError) {
-      console.log(`⚠️  下载失败: ${urlError.message}`);
+      logger.warn(`下载失败`, { url: downloadUrl, error: urlError.message });
     }
   }
   
@@ -431,82 +917,122 @@ async function initGeoIP() {
   try {
     // 加载 ASN 数据库（使用 maxmind.Reader 方式）
     const asnDbPath = path.join(__dirname, "GeoLite2-ASN.mmdb");
-    if (fs.existsSync(asnDbPath)) {
+    if (await fileExists(asnDbPath)) {
       try {
-        const buffer = fs.readFileSync(asnDbPath);
+        const buffer = await readFile(asnDbPath);
         asnReader = new maxmind.Reader(buffer, { watch: false });
-        console.log("✅ GeoIP ASN 数据库加载成功");
+        logger.info("GeoIP ASN 数据库加载成功");
       } catch (err) {
-        console.warn(`⚠️  GeoIP ASN 数据库加载失败: ${err.message}`);
+        logger.warn("GeoIP ASN 数据库加载失败", { error: err.message });
       }
     } else {
-      console.warn(`⚠️  GeoIP ASN 数据库文件不存在: ${asnDbPath}`);
+      logger.warn("GeoIP ASN 数据库文件不存在", { path: asnDbPath });
       // 尝试自动下载
-      console.log(`📥 尝试自动下载 GeoLite2-ASN.mmdb...`);
+      logger.info("尝试自动下载 GeoLite2-ASN.mmdb");
       const downloadSuccess = await downloadGeoIPDatabase(asnDbPath, "GeoLite2-ASN.mmdb");
       if (downloadSuccess) {
         try {
-          const buffer = fs.readFileSync(asnDbPath);
+          const buffer = await readFile(asnDbPath);
           asnReader = new maxmind.Reader(buffer, { watch: false });
-          console.log("✅ GeoIP ASN 数据库加载成功（自动下载）");
+          logger.info("GeoIP ASN 数据库加载成功（自动下载）");
         } catch (err) {
-          console.warn(`⚠️  下载后的 ASN 数据库加载失败: ${err.message}`);
+          logger.warn("下载后的 ASN 数据库加载失败", { error: err.message });
         }
       } else {
-        console.warn(`❌ GeoLite2-ASN.mmdb 自动下载失败，请手动下载`);
+        logger.error("GeoLite2-ASN.mmdb 自动下载失败，请手动下载");
       }
     }
     
     // 加载 City 数据库（包含详细位置信息，使用 maxmind.Reader 方式）
     const cityDbPath = path.join(__dirname, "GeoLite2-City.mmdb");
-    if (fs.existsSync(cityDbPath)) {
+    if (await fileExists(cityDbPath)) {
       try {
-        const buffer = fs.readFileSync(cityDbPath);
+        const buffer = await readFile(cityDbPath);
         cityReader = new maxmind.Reader(buffer, { watch: false });
-        console.log("✅ GeoIP City 数据库加载成功");
+        logger.info("GeoIP City 数据库加载成功");
       } catch (err) {
-        console.warn(`⚠️  GeoIP City 数据库加载失败: ${err.message}`);
+        logger.warn("GeoIP City 数据库加载失败", { error: err.message });
       }
     } else {
-      console.warn(`⚠️  GeoIP City 数据库文件不存在: ${cityDbPath}`);
+      logger.warn("GeoIP City 数据库文件不存在", { path: cityDbPath });
       // 尝试自动下载
-      console.log(`📥 尝试自动下载 GeoLite2-City.mmdb...`);
+      logger.info("尝试自动下载 GeoLite2-City.mmdb");
       const downloadSuccess = await downloadGeoIPDatabase(cityDbPath, "GeoLite2-City.mmdb");
       if (downloadSuccess) {
         try {
-          const buffer = fs.readFileSync(cityDbPath);
+          const buffer = await readFile(cityDbPath);
           cityReader = new maxmind.Reader(buffer, { watch: false });
-          console.log("✅ GeoIP City 数据库加载成功（自动下载）");
+          logger.info("GeoIP City 数据库加载成功（自动下载）");
         } catch (err) {
-          console.warn(`⚠️  下载后的 City 数据库加载失败: ${err.message}`);
+          logger.warn("下载后的 City 数据库加载失败", { error: err.message });
         }
       } else {
-        console.warn(`❌ GeoLite2-City.mmdb 自动下载失败，请手动下载`);
+        logger.error("GeoLite2-City.mmdb 自动下载失败，请手动下载");
       }
     }
     
-    // 测试查询一个已知IP验证数据库工作正常
-    if (cityReader || asnReader) {
-      const testIP = "1.1.1.1";
-      const testCity = cityReader ? cityReader.get(testIP) : null;
-      const testASN = asnReader ? asnReader.get(testIP) : null;
-      if (testCity || testASN) {
-        console.log(`✅ GeoIP 测试查询成功 (${testIP})`);
-      } else {
-        console.warn(`⚠️  GeoIP 测试查询未找到数据 (${testIP})`);
-      }
-    }
   } catch (err) {
-    console.warn("⚠️  GeoIP 数据库初始化失败:", err.message);
-    console.warn("   将跳过地理位置查询功能");
+    logger.error("GeoIP 数据库初始化失败", { error: err.message, message: "将跳过地理位置查询功能" });
   }
 }
 
-initGeoIP();
+// 在后台异步加载 GeoIP 数据库，不阻塞服务器启动
+initGeoIP().catch(err => {
+  logger.warn('GeoIP 数据库加载失败，将在后台重试', { error: err.message });
+});
 
 // ------------------- 请求频率限制和缓存 -------------------
 const requestCache = new Map(); // 用于缓存 API 响应
 const rateLimitMap = new Map(); // 用于速率限制
+
+// 获取客户端真实IP（支持代理）
+function getClientIP(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+         req.headers['x-real-ip'] ||
+         req.ip ||
+         req.connection?.remoteAddress ||
+         req.socket?.remoteAddress ||
+         'unknown';
+}
+
+// 请求日志中间件（记录 API 请求）- 放在 getClientIP 定义之后
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    const startTime = Date.now();
+    const originalSend = res.send;
+    const clientIp = getClientIP(req);
+    
+    // 记录请求开始（静默模式下不输出）
+    // 不输出查询参数和客户端IP（避免泄露敏感信息）
+    if (!QUIET_MODE) {
+      logger.debug(`API 请求开始`, {
+        method: req.method,
+        path: req.path
+      });
+    }
+    
+    res.send = function(data) {
+      const duration = Date.now() - startTime;
+      const logLevel = res.statusCode >= 500 ? 'error' : 
+                       res.statusCode >= 400 ? 'warn' : 'info';
+      
+      // 静默模式下只输出错误和警告，不输出成功的API请求
+      // 不输出客户端IP（避免泄露敏感信息）
+      if (!QUIET_MODE || res.statusCode >= 400) {
+        logger[logLevel](`API 请求完成`, {
+          method: req.method,
+          path: req.path,
+          status: res.statusCode,
+          duration: `${duration}ms`
+        });
+      }
+      
+      return originalSend.call(this, data);
+    };
+  }
+  
+  next();
+});
 
 function checkRateLimit(ip) {
   const now = Date.now();
@@ -519,19 +1045,64 @@ function checkRateLimit(ip) {
   }
   
   if (record.count >= MAX_REQUESTS_PER_IP) {
+    // 不输出IP地址（避免泄露敏感信息）
+    logger.warn('速率限制触发', { count: record.count, limit: MAX_REQUESTS_PER_IP });
     return false;
   }
   
   record.count++;
+  // 不输出IP地址（避免泄露敏感信息）
+  if (!QUIET_MODE) {
+    logger.debug(`速率限制计数`, { count: record.count, limit: MAX_REQUESTS_PER_IP });
+  }
   return true;
 }
+
+// 定期清理过期缓存和速率限制记录（已集成到内存管理模块，保留此作为备用）
+// 注意：主要的内存清理已由上面的内存管理模块处理
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  
+  // 清理过期缓存
+  for (const [key, value] of requestCache.entries()) {
+    if (now - value.timestamp > CACHE_DURATION) {
+      requestCache.delete(key);
+      cleaned++;
+    }
+  }
+  
+  // 清理过期的速率限制记录
+  for (const [key, record] of rateLimitMap.entries()) {
+    if (now - record.firstRequest > RATE_LIMIT_WINDOW * 2) {
+      rateLimitMap.delete(key);
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0) {
+    logger.debug(`定期清理完成，清理了 ${cleaned} 条过期记录`);
+  }
+}, 60000); // 每分钟清理一次
 
 // ------------------- 工具函数 -------------------
 // IP 格式验证函数
 function isIPAddress(str) {
+  if (!str || typeof str !== 'string') return false;
+  
+  // IPv4 验证（检查每个段是否在 0-255 范围内）
   const ipv4Regex = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
-  const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::1$|^::$/;
-  return ipv4Regex.test(str) || ipv6Regex.test(str);
+  if (ipv4Regex.test(str)) {
+    const parts = str.split('.');
+    return parts.every(part => {
+      const num = parseInt(part, 10);
+      return num >= 0 && num <= 255;
+    });
+  }
+  
+  // IPv6 验证（简化版本）
+  const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::1$|^::$|^::/;
+  return ipv6Regex.test(str);
 }
 
 function isDomain(str) {
@@ -610,8 +1181,10 @@ async function resolveDomain(domain, visited = new Set(), depth = 0) {
 
     if (allIPs.size > 0) {
       const uniqueIPs = Array.from(allIPs);
-      if (depth === 0) {
-        console.log(`✅ 解析到 ${uniqueIPs.length} 个 IP: ${uniqueIPs.join(', ')}`);
+      // 静默模式下不输出DNS解析成功信息
+      // 即使不在静默模式，也不输出具体域名和IP地址，只输出数量（避免泄露敏感信息）
+      if (depth === 0 && !QUIET_MODE) {
+        logger.info(`DNS 解析成功`, { count: uniqueIPs.length });
       }
       return uniqueIPs;
     }
@@ -670,8 +1243,18 @@ app.get("/api", async (req, res) => {
   let targetIPs = [];
   if (isDomainName) {
     try {
-      console.log(`\n🔍 DNS 解析域名: ${ip}`);
+      // 静默模式下不输出DNS解析信息
+      // 即使不在静默模式，也不输出具体域名（避免泄露敏感信息）
+      if (!QUIET_MODE) {
+        logger.info(`开始 DNS 解析`, { count: '...' });
+      }
       targetIPs = await resolveDomain(ip);
+      if (!targetIPs || targetIPs.length === 0) {
+        return res.status(400).json({ 
+          error: "DNS 解析失败",
+          message: "域名解析未返回任何 IP 地址"
+        });
+      }
     } catch (err) {
       return res.status(400).json({ 
         error: "DNS 解析失败",
@@ -682,9 +1265,18 @@ app.get("/api", async (req, res) => {
     // 单个 IP
     targetIPs = [ip];
   }
+  
+  // 限制最大检测 IP 数量，防止资源耗尽
+  const MAX_IP_COUNT = 50;
+  if (targetIPs.length > MAX_IP_COUNT) {
+    return res.status(400).json({ 
+      error: "IP 数量过多",
+      message: `检测 IP 数量不能超过 ${MAX_IP_COUNT} 个，当前为 ${targetIPs.length} 个`
+    });
+  }
 
-  // 速率限制
-  const clientIp = req.ip || req.connection.remoteAddress || "unknown";
+  // 速率限制（使用真实IP）
+  const clientIp = getClientIP(req);
   if (!checkRateLimit(clientIp)) {
     return res.status(429).json({ 
       error: "请求过于频繁",
@@ -700,10 +1292,23 @@ app.get("/api", async (req, res) => {
     });
   }
 
-  // 检查缓存（域名缓存使用原始输入）
-  const cacheKey = `${ip}_${targetPort}_${host}`;
+  // 检查缓存
+  // 对于域名，使用原始输入作为缓存键；对于IP，直接使用IP
+  let cacheKey;
+  if (isDomainName) {
+    // 域名检测：使用原始输入作为缓存键
+    cacheKey = `domain_${ip}_${targetPort}_${host}`;
+  } else {
+    // 单个IP：直接使用IP作为缓存键
+    cacheKey = `ip_${ip}_${targetPort}_${host}`;
+  }
+  
   const cached = requestCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    // 静默模式下不输出缓存使用信息
+    if (!QUIET_MODE) {
+      logger.debug(`使用缓存`, { key: cacheKey, age: `${Math.round((Date.now() - cached.timestamp) / 1000)}s` });
+    }
     return res.json(cached.data);
   }
 
@@ -722,36 +1327,45 @@ app.get("/api", async (req, res) => {
     cdn: { warp: "off" }
   };
 
-    // 使用IP作为日志前缀，避免并发时日志混乱
-    const logPrefix = `[IP:${targetIP}]`;
-
     try {
-      console.log(`\n${logPrefix} [${index + 1}/${total}] 📋 开始检测 (Host: ${host})`);
+      // 只在启用检测DEBUG日志时输出详细信息（不输出IP地址和host，避免泄露）
+      if (ENABLE_DETECTION_DEBUG) {
+        logger.debug(`开始检测 IP`, { index: index + 1, total });
+      }
 
       // ----- GeoIP 查询 -----
       try {
         const geoipData = await lookupGeoIP(targetIP);
         if (geoipData && Object.keys(geoipData).length > 0) {
           result.geoip = geoipData;
-          console.log(`${logPrefix} ✅ GeoIP: ${geoipData.city || ''}${geoipData.city ? ', ' : ''}${geoipData.countryName || geoipData.country || ''}${geoipData.organization ? ' / ' + geoipData.organization : ''}`);
-        } else {
-          console.warn(`${logPrefix} ⚠️  GeoIP: 未找到数据`);
+          // 只在启用检测DEBUG日志时输出（不输出IP地址，避免泄露）
+          if (ENABLE_DETECTION_DEBUG) {
+            logger.debug(`GeoIP 查询成功`, { 
+              location: `${geoipData.city || ''}${geoipData.city ? ', ' : ''}${geoipData.countryName || geoipData.country || ''}`,
+              organization: geoipData.organization 
+            });
+          }
         }
       } catch (err) {
-        console.warn(`${logPrefix} ⚠️  GeoIP 查询失败: ${err.message}`);
+        // 错误日志也不输出IP地址（避免泄露）
+        logger.warn(`GeoIP 查询失败`, { error: err.message });
       }
 
       // ----- TLS 检测 -----
       const tlsStart = Date.now();
       try {
         await testTLS(targetIP, targetPort, host);
-    result.checks.tls_detect = true;
+        result.checks.tls_detect = true;
         result.latency.tls_handshake_ms = Date.now() - tlsStart;
-        console.log(`${logPrefix} ✅ TLS: ${result.latency.tls_handshake_ms}ms`);
-  } catch (err) {
-    result.checks.tls_detect = false;
+        // 只在启用检测DEBUG日志时输出成功信息（不输出IP地址，避免泄露）
+        if (ENABLE_DETECTION_DEBUG) {
+          logger.debug(`TLS 检测成功`, { latency: `${result.latency.tls_handshake_ms}ms` });
+        }
+      } catch (err) {
+        result.checks.tls_detect = false;
         result.latency.tls_handshake_ms = Date.now() - tlsStart;
-        console.error(`${logPrefix} ❌ TLS: ${err.message}`);
+        // 错误日志也不输出IP地址（避免泄露）
+        logger.warn(`TLS 检测失败`, { error: err.message });
       }
 
       // ----- WebSocket 检测 -----
@@ -760,19 +1374,25 @@ app.get("/api", async (req, res) => {
         // 云平台环境：跳过 WebSocket 检测
         result.checks.ws_real_connect = false;
         result.latency.ws_connect_ms = 0;
-        console.log(`${logPrefix} ⏭️  WebSocket: 已禁用（云平台优化）`);
+        // 只在启用检测DEBUG日志时输出（不输出IP地址，避免泄露）
+        if (ENABLE_DETECTION_DEBUG) {
+          logger.debug(`WebSocket 已禁用`, { reason: '云平台优化' });
+        }
       } else {
         try {
           const wsInfo = await testWebSocket(targetIP, targetPort, host, wsPath);
           result.checks.ws_real_connect = true;
           result.latency.ws_connect_ms = Date.now() - wsStart;
           if (wsInfo) result.websocket = wsInfo;
-          console.log(`${logPrefix} ✅ WebSocket: ${result.latency.ws_connect_ms}ms`);
+          // 只在启用检测DEBUG日志时输出成功信息（不输出IP地址，避免泄露）
+          if (ENABLE_DETECTION_DEBUG) {
+            logger.debug(`WebSocket 检测成功`, { latency: `${result.latency.ws_connect_ms}ms` });
+          }
         } catch (err) {
           result.checks.ws_real_connect = false;
           result.latency.ws_connect_ms = Date.now() - wsStart;
-          result.websocket = { error: err.message };
-          console.warn(`${logPrefix} ⚠️  WebSocket: ${err.message}`);
+          // 错误日志也不输出IP地址（避免泄露）
+          logger.warn(`WebSocket 检测失败`, { error: err.message });
         }
       }
 
@@ -780,51 +1400,65 @@ app.get("/api", async (req, res) => {
       if (DISABLE_CDN_TRACE) {
         // 云平台环境：跳过 CDN Trace 检测
         result.checks.cdn_trace = false;
-        console.log(`${logPrefix} ⏭️  CDN Trace: 已禁用（云平台优化）`);
+        // 只在启用检测DEBUG日志时输出（不输出IP地址，避免泄露）
+        if (ENABLE_DETECTION_DEBUG) {
+          logger.debug(`CDN Trace 已禁用`, { reason: '云平台优化' });
+        }
       } else {
         try {
           const cdnResult = await testCDNTrace(targetIP, targetPort, host);
           result.checks.cdn_trace = cdnResult.success;
           if (cdnResult.warp) result.cdn.warp = cdnResult.warp;
-          // trace 内容不在API响应中返回（仅用于内部检测）
-          if (cdnResult.success && cdnResult.warp) {
-            console.log(`${logPrefix} ✅ CDN Trace: ${cdnResult.warp || 'off'}`);
-          } else {
-            console.warn(`${logPrefix} ⚠️  CDN Trace: 不可用`);
-          }
+          // 只在启用检测DEBUG日志时输出（成功和失败都不输出，减少日志）
+          // 仅在失败时输出警告（不输出IP地址，避免泄露）
         } catch (err) {
           result.checks.cdn_trace = false;
-          console.warn(`${logPrefix} ⚠️  CDN Trace: ${err.message}`);
+          logger.warn(`CDN Trace 检测失败`, { error: err.message });
         }
       }
 
-      console.log(`${logPrefix} ✓ 检测完成`);
+      // 只在启用检测DEBUG日志时输出完成信息（不输出IP地址，避免泄露）
+      if (ENABLE_DETECTION_DEBUG) {
+        logger.debug(`IP 检测完成`);
+      }
       return result;
     } catch (err) {
       // 即使检测过程中出现意外错误，也返回部分结果，不影响其他IP
-      console.error(`${logPrefix} ❌ 检测异常: ${err.message}`);
+      // 错误日志也不输出IP地址（避免泄露）
+      logger.error(`IP 检测异常`, { error: err.message });
       result.error = err.message;
       return result;
     }
   }
 
-  // 并行检测所有 IP（每个IP完全独立，使用 Promise.allSettled 避免一个失败影响全部）
-  console.log(`\n🚀 开始并行检测 ${targetIPs.length} 个 IP 地址...`);
-  const results = await Promise.all(
-    targetIPs.map((targetIP, index) => detectSingleIP(targetIP, index, targetIPs.length))
-  );
-
-  // 验证结果完整性：确保每个IP都有对应的结果
-  if (results.length !== targetIPs.length) {
-    console.error(`⚠️  警告: 检测结果数量(${results.length})与IP数量(${targetIPs.length})不匹配`);
+  // 并行检测所有 IP（每个IP完全独立，使用 Promise.all 避免一个失败影响全部）
+  // 添加并发控制：如果IP数量过多，分批检测
+  const MAX_CONCURRENT = 10; // 最大并发数
+  
+  // 静默模式下不输出检测开始信息
+  // 即使不在静默模式，也不输出具体IP数量（避免泄露敏感信息）
+  if (!QUIET_MODE) {
+    logger.info(`开始检测`, { maxConcurrent: MAX_CONCURRENT });
   }
   
-  // 验证每个结果的IP是否匹配
-  results.forEach((result, index) => {
-    if (result.ip !== targetIPs[index]) {
-      console.error(`⚠️  警告: 结果索引${index}的IP不匹配: 期望${targetIPs[index]}, 实际${result.ip}`);
-    }
-  });
+  const results = [];
+  for (let i = 0; i < targetIPs.length; i += MAX_CONCURRENT) {
+    const batch = targetIPs.slice(i, i + MAX_CONCURRENT);
+    const batchResults = await Promise.all(
+      batch.map((targetIP, batchIndex) => 
+        detectSingleIP(targetIP, i + batchIndex, targetIPs.length)
+      )
+    );
+    results.push(...batchResults);
+  }
+
+  // 验证结果完整性（仅在开发环境或结果异常时输出警告）
+  if (results.length !== targetIPs.length) {
+    logger.warn(`检测结果数量不匹配`, { 
+      resultsCount: results.length, 
+      ipsCount: targetIPs.length 
+    });
+  }
 
   // 清理和精简结果数据
   const cleanedResults = results.map(r => {
@@ -901,12 +1535,19 @@ app.get("/api", async (req, res) => {
   // 缓存结果
   requestCache.set(cacheKey, { data: response, timestamp: Date.now() });
 
-  // 输出汇总
-  console.log(`\n📊 检测完成: ${results.length} 个 IP`);
-  console.log(`   TLS 成功: ${results.filter(r => r.checks.tls_detect).length}/${results.length}`);
-  console.log(`   WebSocket 成功: ${results.filter(r => r.checks.ws_real_connect).length}/${results.length}`);
-  console.log(`   CDN Trace 成功: ${results.filter(r => r.checks.cdn_trace).length}/${results.length}`);
-  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+  // 输出汇总（静默模式下不输出）
+  // 不输出具体数量，只输出统计信息（避免泄露敏感信息）
+  if (!QUIET_MODE) {
+    const tlsSuccess = results.filter(r => r.checks.tls_detect).length;
+    const wsSuccess = results.filter(r => r.checks.ws_real_connect).length;
+    const cdnSuccess = results.filter(r => r.checks.cdn_trace).length;
+    
+    logger.info(`检测完成`, {
+      tls: `${tlsSuccess}/${results.length}`,
+      websocket: `${wsSuccess}/${results.length}`,
+      cdnTrace: `${cdnSuccess}/${results.length}`
+    });
+  }
 
   res.json(response);
 });
@@ -944,7 +1585,8 @@ async function lookupGeoIP(ip) {
 
     return Object.keys(result).length > 0 ? result : null;
   } catch (err) {
-    console.warn(`GeoIP 查询异常 (${ip}):`, err.message);
+    // 错误日志也不输出IP地址（避免泄露敏感信息）
+    logger.warn(`GeoIP 查询异常`, { error: err.message });
     return null;
   }
 }
@@ -959,6 +1601,7 @@ async function testTLS(ip, port = DEFAULT_PORT, host) {
       method: 'HEAD',
       rejectUnauthorized: false,
       timeout: TLS_TIMEOUT,
+      servername: host, // 设置 SNI（Server Name Indication）
       headers: {
         'Host': host
       }
@@ -1138,8 +1781,7 @@ async function testCDNTrace(ip, port = DEFAULT_PORT, host) {
 
         resolve({ 
           success: true, 
-          warp: warp === "on" ? "on" : "off",
-          trace: data
+          warp: warp === "on" ? "on" : "off"
         });
       });
     });
@@ -1157,15 +1799,6 @@ async function testCDNTrace(ip, port = DEFAULT_PORT, host) {
   });
 }
 
-// ------------------- 错误处理中间件 -------------------
-app.use((err, req, res, next) => {
-  console.error("服务器错误:", err);
-  res.status(500).json({ 
-    error: "服务器内部错误",
-    message: err.message 
-  });
-});
-
 // ------------------- 404 处理 -------------------
 app.use((req, res) => {
   // 对于静态资源请求返回 204，避免产生错误日志
@@ -1179,33 +1812,60 @@ app.use((req, res) => {
   });
 });
 
+// ------------------- 错误处理中间件（必须在所有路由之后）-------------------
+app.use((err, req, res, next) => {
+  logger.error("服务器错误", { error: err.message, stack: err.stack });
+  res.status(500).json({ 
+    error: "服务器内部错误",
+    message: err.message 
+  });
+});
+
 // ------------------- 启动服务 -------------------
 function startServer() {
   try {
+    // 先启动服务器，不等待 GeoIP 加载
     const server = app.listen(PORT, () => {
-      console.log(`✅ CF IP 检测服务已启动，端口: ${PORT}`);
-      console.log(`📡 API 端点: http://localhost:${PORT}/api`);
-      console.log(`🌐 Web 界面: http://localhost:${PORT}/`);
-      console.log(`\n📦 功能配置:`);
-      console.log(`   WebSocket 检测: ${DISABLE_WEBSOCKET ? '⏭️ 已禁用（云平台优化）' : '✅ 已启用'}`);
-      console.log(`   CDN Trace 检测: ${DISABLE_CDN_TRACE ? '⏭️ 已禁用（云平台优化）' : '✅ 已启用'}`);
-      console.log(`   GeoIP 数据库: ✅ 自动加载`);
-      console.log(`\n使用说明:`);
-      console.log(`  - 访问 Web 界面进行可视化检测`);
-      console.log(`  - 或直接调用 API: GET /api?ip=172.69.21.100&port=443&host=你的cloudflare 节点域名`);
+      console.log('\n' + '='.repeat(60));
+      logger.info('CF IP 检测服务已启动');
+      console.log(`  端口: ${PORT}`);
+      console.log(`  API: http://localhost:${PORT}/api`);
+      console.log(`  Web: http://localhost:${PORT}/`);
+      console.log('\n功能配置:');
+      console.log(`  WebSocket: ${DISABLE_WEBSOCKET ? '⏭️ 已禁用' : '✅ 已启用'}`);
+      console.log(`  CDN Trace: ${DISABLE_CDN_TRACE ? '⏭️ 已禁用' : '✅ 已启用'}`);
+      console.log(`  GeoIP: ✅ 自动加载（后台）`);
+      console.log(`  日志级别: ${LOG_LEVEL}`);
+      console.log(`  检测DEBUG日志: ${ENABLE_DETECTION_DEBUG ? '✅ 已启用' : '⏭️ 已禁用（减少日志输出）'}`);
+      console.log(`  静默模式: ${QUIET_MODE ? '✅ 已启用（不输出检测内容）' : '⏭️ 已禁用'}`);
+      console.log(`  内存清理阈值: ${MEMORY_CLEANUP_THRESHOLD} MB`);
+      console.log('='.repeat(60) + '\n');
+      
+      // 输出内存使用情况
+      logMemoryUsage('启动时');
     });
 
     // 处理优雅关闭
     process.on('SIGTERM', () => {
-      console.log('\n收到 SIGTERM 信号，正在关闭服务器...');
+      logger.info('收到 SIGTERM 信号，正在关闭服务器...');
+      logMemoryUsage('关闭前');
       server.close(() => {
-        console.log('服务器已关闭');
+        logger.info('服务器已关闭');
+        process.exit(0);
+      });
+    });
+
+    process.on('SIGINT', () => {
+      logger.info('收到 SIGINT 信号，正在关闭服务器...');
+      logMemoryUsage('关闭前');
+      server.close(() => {
+        logger.info('服务器已关闭');
         process.exit(0);
       });
     });
 
   } catch (err) {
-    console.error('❌ 启动服务器失败:', err.message);
+    logger.error('启动服务器失败', { error: err.message });
     process.exit(1);
   }
 }
